@@ -5,3 +5,4 @@ apscheduler==3.10.4
 yt-dlp==2024.5.27
 mutagen==1.47.0
 python-dotenv==1.0.1
+instaloader==4.10.3
