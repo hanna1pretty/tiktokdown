@@ -1,0 +1,13 @@
+# Cek apakah .env sudah di .gitignore
+cat .gitignore
+
+# Kalau belum ada, tambahkan
+echo ".env" >> .gitignore
+echo "*.db" >> .gitignore
+echo "__pycache__/" >> .gitignore
+echo "venv/" >> .gitignore
+
+# Commit .gitignore
+git add .gitignore
+git commit -m "add .gitignore — exclude .env and cache files"
+git push origin main
