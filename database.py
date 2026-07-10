@@ -2,13 +2,14 @@
 database.py
 -----------
 Handles all SQLite caching logic using aiosqlite for non-blocking I/O.
-Stores Telegram file_ids keyed by TikTok URL to avoid re-uploading.
+Stores Telegram file_ids keyed by URL to avoid re-uploading.
 
 Cache schema:
-  - url          : Original TikTok URL (primary key)
+  - url          : Original URL (primary key)
+  - platform     : 'tiktok' | 'instagram' | 'facebook'
   - content_type : 'video' | 'carousel'
   - file_ids     : JSON-encoded list of Telegram file_ids
-  - audio_file_id: Telegram file_id for the extracted MP3
+  - audio_file_id: Telegram file_id for the extracted MP3 (TikTok only)
   - created_at   : Unix timestamp for TTL cleanup
 """
 
@@ -23,13 +24,11 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path("cache.db")
 
 
-# CHANGE: Replace init_db() only — everything else in database.py stays the same
-
 async def init_db() -> None:
     """
-    Initialize the SQLite database.
-    UPDATED: Added 'platform' column (tiktok | instagram | facebook)
-    for multi-platform cache tracking.
+    Initialize the SQLite database and create the cache table if it doesn't exist.
+    Non-destructive migration: safely adds 'platform' column if upgrading from old schema.
+    Called once at bot startup.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -42,27 +41,65 @@ async def init_db() -> None:
                 created_at    REAL NOT NULL
             )
         """)
-        # Non-destructive migration: add column if upgrading from old schema
+        # Safe migration for existing databases that don't have 'platform' column yet
         try:
-            await db.execute("ALTER TABLE cache ADD COLUMN platform TEXT NOT NULL DEFAULT 'tiktok'")
+            await db.execute(
+                "ALTER TABLE cache ADD COLUMN platform TEXT NOT NULL DEFAULT 'tiktok'"
+            )
         except Exception:
             pass  # Column already exists — safe to ignore
         await db.commit()
     logger.info("Database initialized at %s", DB_PATH)
 
 
-# CHANGE: Replace set_cached() to accept platform parameter
+async def get_cached(url: str) -> dict | None:
+    """
+    Look up a URL in the cache.
+
+    Args:
+        url: The normalized URL string.
+
+    Returns:
+        A dict with keys {platform, content_type, file_ids, audio_file_id} if found,
+        or None if the URL is not cached.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT content_type, file_ids, audio_file_id, platform
+            FROM cache
+            WHERE url = ?
+            """,
+            (url,)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    if row:
+        return {
+            "content_type":  row[0],
+            "file_ids":      json.loads(row[1]),
+            "audio_file_id": row[2],
+            "platform":      row[3] or "tiktok",  # fallback for old records
+        }
+    return None
+
 
 async def set_cached(
     url: str,
     content_type: str,
     file_ids: list[str],
     audio_file_id: str | None = None,
-    platform: str = "tiktok",          # NEW parameter
+    platform: str = "tiktok",
 ) -> None:
     """
-    Insert or replace a cache record.
-    UPDATED: Now stores platform alongside the entry.
+    Insert or replace a cache record for a URL.
+
+    Args:
+        url          : The normalized URL.
+        content_type : 'video' or 'carousel'.
+        file_ids     : List of Telegram file_ids.
+        audio_file_id: Telegram file_id for MP3 audio (TikTok only, others pass None).
+        platform     : 'tiktok' | 'instagram' | 'facebook'.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -75,3 +112,27 @@ async def set_cached(
         )
         await db.commit()
     logger.debug("Cached [%s][%s]: %s", platform, content_type, url)
+
+
+async def delete_expired(ttl_days: int = 7) -> int:
+    """
+    Delete all cache records older than ttl_days days.
+    Called by the background scheduler every 24 hours.
+
+    Args:
+        ttl_days: Number of days before a record is considered stale.
+
+    Returns:
+        Number of rows deleted.
+    """
+    cutoff = time.time() - (ttl_days * 86400)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM cache WHERE created_at < ?", (cutoff,)
+        )
+        await db.commit()
+        deleted = cursor.rowcount
+
+    if deleted:
+        logger.info("Cache cleanup: removed %d expired record(s)", deleted)
+    return deleted
