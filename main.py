@@ -5,7 +5,9 @@ Bot entry point. Wires together:
   - aiogram 3.x dispatcher + Router
   - Anti-spam middleware (per-user cooldown)
   - /start, /help command handlers
-  - TikTok URL auto-detection handler
+  - TikTok, Instagram, Facebook URL auto-detection
+  - Silent cache delivery (no "from cache" messages)
+  - Audio delivery for TikTok only
   - APScheduler background task for cache cleanup
   - Graceful startup & shutdown lifecycle hooks
 """
@@ -21,7 +23,6 @@ from typing import Callable, Any, Awaitable
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message,
-    BufferedInputFile,
     InputMediaPhoto,
     FSInputFile,
 )
@@ -54,12 +55,32 @@ CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "7"))
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in .env")
 
-# Regex pattern that matches all TikTok URL variants:
-#   tiktok.com/@user/video/ID
-#   vm.tiktok.com/shortcode
-#   vt.tiktok.com/shortcode
+# ---------------------------------------------------------------------------
+# URL Regex Patterns
+# ---------------------------------------------------------------------------
+
 TIKTOK_URL_PATTERN = re.compile(
     r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+",
+    re.IGNORECASE,
+)
+
+INSTAGRAM_URL_PATTERN = re.compile(
+    r"https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reel|tv|stories)/\S+",
+    re.IGNORECASE,
+)
+
+FACEBOOK_URL_PATTERN = re.compile(
+    r"https?://(?:www\.|m\.|web\.)?(?:facebook\.com|fb\.watch|fb\.com)/\S+",
+    re.IGNORECASE,
+)
+
+# Combined pattern used as the message handler filter
+ANY_SUPPORTED_URL_PATTERN = re.compile(
+    r"https?://(?:"
+    r"(?:www\.|vm\.|vt\.)?tiktok\.com"
+    r"|(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reel|tv|stories)"
+    r"|(?:www\.|m\.|web\.)?(?:facebook\.com|fb\.watch|fb\.com)"
+    r")/\S+",
     re.IGNORECASE,
 )
 
@@ -72,15 +93,12 @@ router = Router()
 class CooldownMiddleware:
     """
     Per-user cooldown middleware.
-    Rejects requests that arrive faster than COOLDOWN_SEC seconds
-    for the same user, preventing Telegram flood-wait errors.
-
-    Implemented as a classic callable middleware compatible with aiogram 3.
+    Rejects requests faster than COOLDOWN_SEC seconds per user,
+    preventing Telegram flood-wait errors.
     """
 
     def __init__(self, cooldown: float = 3.0):
         self.cooldown = cooldown
-        # Maps user_id → timestamp of their last accepted request
         self._last_seen: dict[int, float] = {}
 
     async def __call__(
@@ -89,16 +107,14 @@ class CooldownMiddleware:
         event: Message,
         data: dict[str, Any],
     ) -> Any:
-        user_id = event.from_user.id if event.from_user else 0
-        now = time.monotonic()
-        last = self._last_seen.get(user_id, 0.0)
+        user_id   = event.from_user.id if event.from_user else 0
+        now       = time.monotonic()
+        last      = self._last_seen.get(user_id, 0.0)
         remaining = self.cooldown - (now - last)
 
         if remaining > 0:
-            # Silently ignore the duplicate — or uncomment below to notify:
-            # await event.answer(f"⏳ Please wait {remaining:.1f}s before sending another link.")
             logger.debug("Rate-limited user %d (%.1fs remaining)", user_id, remaining)
-            return  # swallow the event
+            return  # Silently swallow the event
 
         self._last_seen[user_id] = now
         return await handler(event, data)
@@ -110,128 +126,170 @@ class CooldownMiddleware:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    """Handle the /start command with a friendly welcome message."""
+    """
+    /start — Personalized welcome using the user's first name.
+    Clean formatting with minimal emojis.
+    """
+    first_name = message.from_user.first_name if message.from_user else "there"
+
     await message.answer(
-        "👋 <b>Welcome to TikTok Downloader Bot!</b>\n\n"
-        "Simply paste any TikTok link and I'll fetch:\n"
-        "  🎬 <b>Video</b> — HD, no watermark\n"
-        "  🎵 <b>Audio</b> — extracted MP3\n"
-        "  🖼️ <b>Photos</b> — full carousel album\n\n"
-        "Just send a link to get started!",
+        f"Welcome, <b>{first_name}</b>.\n\n"
+        "This bot downloads media from <b>TikTok</b>, <b>Instagram</b>, and "
+        "<b>Facebook</b> — delivered directly in Telegram, no watermarks.\n\n"
+        "<b>What you get</b>\n"
+        "<blockquote>"
+        "· TikTok — HD video + extracted MP3 audio\n"
+        "· Instagram — Reels as video, Posts as photo album\n"
+        "· Facebook — Public videos and Reels"
+        "</blockquote>\n"
+        "<b>How to use</b>\n"
+        "<blockquote>"
+        "1. Copy any supported link\n"
+        "2. Paste it here — no commands needed\n"
+        "3. Your media will be sent momentarily"
+        "</blockquote>\n"
+        "<i>Only public content is supported. "
+        "Private accounts and login-required content cannot be accessed.</i>",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    """Handle the /help command with usage instructions."""
+    """
+    /help — Lists all supported URL formats across platforms.
+    """
     await message.answer(
-        "ℹ️ <b>How to use:</b>\n\n"
-        "1. Copy any TikTok link\n"
-        "2. Paste it here\n"
-        "3. Receive the HD video + MP3 audio (or photo album)\n\n"
-        "<b>Supported URL formats:</b>\n"
-        "• <code>https://www.tiktok.com/@user/video/ID</code>\n"
-        "• <code>https://vm.tiktok.com/shortcode</code>\n"
-        "• <code>https://vt.tiktok.com/shortcode</code>\n\n"
-        "⚠️ Please wait a few seconds between requests.",
+        "<b>Supported Platforms</b>\n\n"
+        "<b>TikTok</b>\n"
+        "<blockquote>"
+        "tiktok.com/@user/video/ID\n"
+        "vm.tiktok.com/shortcode\n"
+        "vt.tiktok.com/shortcode"
+        "</blockquote>\n"
+        "<b>Instagram</b>\n"
+        "<blockquote>"
+        "instagram.com/p/shortcode\n"
+        "instagram.com/reel/shortcode"
+        "</blockquote>\n"
+        "<b>Facebook</b>\n"
+        "<blockquote>"
+        "facebook.com/watch?v=ID\n"
+        "facebook.com/reel/ID\n"
+        "fb.watch/shortcode"
+        "</blockquote>\n"
+        "<i>A 3-second cooldown applies between requests "
+        "to ensure stable delivery.</i>",
         parse_mode=ParseMode.HTML,
     )
 
 
 # ---------------------------------------------------------------------------
-# Core TikTok Handler
+# Core Media Handler
 # ---------------------------------------------------------------------------
 
-@router.message(F.text.regexp(TIKTOK_URL_PATTERN))
-async def handle_tiktok_link(message: Message, bot: Bot) -> None:
+@router.message(F.text.regexp(ANY_SUPPORTED_URL_PATTERN))
+async def handle_media_link(message: Message, bot: Bot) -> None:
     """
-    Main handler triggered whenever a message contains a TikTok URL.
+    Universal handler for TikTok, Instagram, and Facebook URLs.
 
     Flow:
-      1. Extract & normalize URL from the message
-      2. Check SQLite cache → send instantly if found
-      3. Fetch fresh data from API (tikwm → yt-dlp fallback)
-      4. Download & upload media, then cache the file_ids
+      1. Extract & detect platform from the message
+      2. Check SQLite cache — deliver silently if found
+      3. Show "Processing..." only for fresh fetches
+      4. Fetch, download, upload, then cache file_ids
       5. Clean up all temporary files
     """
-    # ── Step 1: Extract URL ────────────────────────────────────────────────
-    match = TIKTOK_URL_PATTERN.search(message.text or "")
+    text = message.text or ""
+
+    # Match URL in priority order
+    match = (
+        TIKTOK_URL_PATTERN.search(text)
+        or INSTAGRAM_URL_PATTERN.search(text)
+        or FACEBOOK_URL_PATTERN.search(text)
+    )
     if not match:
         return
-    raw_url  = match.group(0)
+
+    raw_url   = match.group(0)
     clean_url = api.normalize_url(raw_url)
+    platform  = api.detect_platform(clean_url)
 
     user_id = message.from_user.id if message.from_user else 0
-    logger.info("User %d → %s", user_id, clean_url)
+    logger.info("User %d | %s | %s", user_id, platform.upper(), clean_url)
 
-    # ── Step 2: Cache hit ──────────────────────────────────────────────────
+    # ── Cache hit: completely silent delivery ──────────────────────────────
     cached = await database.get_cached(clean_url)
     if cached:
-        status_msg = await message.answer("⚡ <i>Sending from cache...</i>", parse_mode=ParseMode.HTML)
-        try:
-            await _deliver_from_cache(message, bot, cached)
-        finally:
-            await bot.delete_message(message.chat.id, status_msg.message_id)
+        await _deliver_from_cache(message, bot, cached)
         return
 
-    # ── Step 3: Fetch metadata ─────────────────────────────────────────────
-    status_msg = await message.answer("⏳ <i>Please wait, processing your link...</i>", parse_mode=ParseMode.HTML)
+    # ── Fresh fetch: show status message ──────────────────────────────────
+    status_msg = await message.answer(
+        "<i>Processing your link, please wait...</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
-    tiktok_data = await api.fetch_tiktok_data(clean_url)
-    if not tiktok_data:
+    media_data = await api.fetch_media_data(clean_url, platform=platform)
+
+    if not media_data:
+        platform_hints = {
+            "instagram": "\n<i>Make sure the account is public.</i>",
+            "facebook":  "\n<i>Only public Facebook content is supported.</i>",
+            "tiktok":    "",
+        }
+        hint = platform_hints.get(platform, "")
         await status_msg.edit_text(
-            "❌ <b>Failed to fetch this TikTok.</b>\n"
-            "The link may be private, deleted, or the service is temporarily down.",
+            f"<b>Unable to process this link.</b>\n"
+            f"The content may be private, deleted, or temporarily unavailable.{hint}",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # ── Step 4: Download & upload ──────────────────────────────────────────
+    # ── Route to correct processor ─────────────────────────────────────────
     try:
-        if tiktok_data["content_type"] == "video":
-            await _process_video(message, bot, status_msg, clean_url, tiktok_data)
+        if media_data["content_type"] == "video":
+            await _process_video(
+                message, bot, status_msg, clean_url, media_data, platform=platform
+            )
         else:
-            await _process_carousel(message, bot, status_msg, clean_url, tiktok_data)
+            await _process_carousel(
+                message, bot, status_msg, clean_url, media_data, platform=platform
+            )
     except Exception as exc:
-        logger.exception("Unhandled error processing %s: %s", clean_url, exc)
+        logger.exception(
+            "Unhandled error [%s] %s: %s", platform, clean_url, exc
+        )
         await status_msg.edit_text(
-            "❌ An unexpected error occurred. Please try again later.",
+            "<b>An unexpected error occurred.</b> Please try again in a moment.",
             parse_mode=ParseMode.HTML,
         )
 
 
 # ---------------------------------------------------------------------------
-# Delivery helpers
+# Delivery Helpers
 # ---------------------------------------------------------------------------
 
 async def _deliver_from_cache(message: Message, bot: Bot, cached: dict) -> None:
     """
-    Send media entirely from cached Telegram file_ids.
-    Zero bytes transferred — instant delivery.
+    Deliver media from cached Telegram file_ids.
+    Completely silent — no status messages, no labels.
+    Audio only sent for TikTok entries.
     """
     file_ids      = cached["file_ids"]
     audio_file_id = cached.get("audio_file_id")
     content_type  = cached["content_type"]
+    platform      = cached.get("platform", "tiktok")
 
     if content_type == "video":
-        await message.answer_video(
-            video   = file_ids[0],
-            caption = "🎬 <b>HD Video</b> (cached)",
-            parse_mode = ParseMode.HTML,
-        )
+        await message.answer_video(video=file_ids[0])
     else:
-        # Carousel: send as album using file_ids
         media_group = [InputMediaPhoto(media=fid) for fid in file_ids]
         await message.answer_media_group(media=media_group)
 
-    # Send audio if available
-    if audio_file_id:
-        await message.answer_audio(
-            audio      = audio_file_id,
-            caption    = "🎵 <b>Extracted Audio</b>",
-            parse_mode = ParseMode.HTML,
-        )
+    # Audio only for TikTok
+    if platform == "tiktok" and audio_file_id:
+        await message.answer_audio(audio=audio_file_id)
 
 
 async def _process_video(
@@ -240,61 +298,78 @@ async def _process_video(
     status_msg: Message,
     url: str,
     data: api.VideoData,
+    platform: str = "tiktok",
 ) -> None:
     """
-    Download a TikTok video + audio, upload to Telegram, then cache file_ids.
-    Cleans up temp files regardless of success or failure.
+    Download a video, upload to Telegram, cache file_ids.
+    Audio extraction and upload only applies to TikTok.
+    Cleans up all temp files regardless of success or failure.
     """
     video_path = audio_path = None
 
     try:
-        await status_msg.edit_text("⬇️ <i>Downloading video...</i>", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            "<i>Downloading video...</i>", parse_mode=ParseMode.HTML
+        )
 
-        # Download video to temp file
-        video_path = await api.download_to_tempfile(data["video_url"], suffix=".mp4")
+        video_path = await api.download_to_tempfile(
+            data["video_url"], suffix=".mp4"
+        )
         if not video_path:
-            await status_msg.edit_text("❌ Failed to download the video file.")
+            await status_msg.edit_text(
+                "<b>Download failed.</b> The source file could not be retrieved.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-        # Extract audio from the downloaded video
-        await status_msg.edit_text("🎵 <i>Extracting audio...</i>", parse_mode=ParseMode.HTML)
-        audio_path = await api.extract_audio_from_video(video_path)
+        # Audio extraction — TikTok only
+        if platform == "tiktok":
+            await status_msg.edit_text(
+                "<i>Extracting audio...</i>", parse_mode=ParseMode.HTML
+            )
+            audio_path = await api.extract_audio_from_video(video_path)
 
-        # If extraction fails but we have a direct audio URL, download that instead
-        if not audio_path and data.get("audio_url"):
-            audio_path = await api.download_to_tempfile(data["audio_url"], suffix=".mp3")
+            # Fallback to direct audio URL if ffmpeg extraction fails
+            if not audio_path and data.get("audio_url"):
+                audio_path = await api.download_to_tempfile(
+                    data["audio_url"], suffix=".mp3"
+                )
+
+        await status_msg.edit_text(
+            "<i>Uploading to Telegram...</i>", parse_mode=ParseMode.HTML
+        )
 
         # Upload video
-        await status_msg.edit_text("⬆️ <i>Uploading to Telegram...</i>", parse_mode=ParseMode.HTML)
+        caption = (
+            f"<b>{data['title'][:900]}</b>" if data.get("title") else None
+        )
         video_msg = await message.answer_video(
             video      = FSInputFile(video_path),
-            caption    = f"🎬 <b>HD Video</b>\n<i>{data['title'][:900]}</i>" if data["title"] else "🎬 <b>HD Video</b>",
+            caption    = caption,
             parse_mode = ParseMode.HTML,
         )
         video_file_id = video_msg.video.file_id
 
-        # Upload audio
+        # Upload audio — TikTok only
         audio_file_id = None
-        if audio_path and audio_path.exists():
+        if platform == "tiktok" and audio_path and audio_path.exists():
             audio_msg = await message.answer_audio(
-                audio      = FSInputFile(audio_path),
-                caption    = "🎵 <b>Extracted Audio</b>",
-                parse_mode = ParseMode.HTML,
+                audio = FSInputFile(audio_path),
             )
             audio_file_id = audio_msg.audio.file_id
 
-        # Cache the file_ids for instant future delivery
+        # Persist to cache
         await database.set_cached(
             url           = url,
             content_type  = "video",
             file_ids      = [video_file_id],
-            audio_file_id = audio_file_id,
+            audio_file_id = audio_file_id,  # None for non-TikTok
+            platform      = platform,
         )
 
         await bot.delete_message(message.chat.id, status_msg.message_id)
 
     finally:
-        # Always delete temp files, even on error
         for path in (video_path, audio_path):
             if path and path.exists():
                 try:
@@ -309,18 +384,22 @@ async def _process_carousel(
     status_msg: Message,
     url: str,
     data: api.VideoData,
+    platform: str = "tiktok",
 ) -> None:
     """
-    Download carousel images + audio, send as Telegram album, then cache file_ids.
-    Cleans up all temp files after upload.
+    Download carousel images + audio, send as Telegram album, cache file_ids.
+    Audio only applies to TikTok carousels (slideshow posts with music).
+    Cleans up all temp files regardless of success or failure.
     """
     image_paths: list[Path] = []
     audio_path  = None
 
     try:
-        await status_msg.edit_text("⬇️ <i>Downloading photos...</i>", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            "<i>Downloading photos...</i>", parse_mode=ParseMode.HTML
+        )
 
-        # Download each carousel image concurrently for speed
+        # Download all images concurrently
         download_tasks = [
             api.download_to_tempfile(img_url, suffix=".jpg")
             for img_url in data["image_urls"]
@@ -331,52 +410,54 @@ async def _process_carousel(
             if isinstance(res, Path):
                 image_paths.append(res)
             else:
-                logger.warning("One carousel image failed to download: %s", res)
+                logger.warning("Carousel image download failed: %s", res)
 
         if not image_paths:
-            await status_msg.edit_text("❌ Could not download any photos from this carousel.")
+            await status_msg.edit_text(
+                "<b>Could not download any photos</b> from this post.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-        # Download audio
-        if data.get("audio_url"):
-            audio_path = await api.download_to_tempfile(data["audio_url"], suffix=".mp3")
-
-        # Build Telegram MediaGroup (album); first item gets the caption
-        media_group = [
-            InputMediaPhoto(
-                media   = FSInputFile(img_path),
-                caption = (f"🖼️ <b>Photo {i+1}/{len(image_paths)}</b>" if i == 0 else None),
-                parse_mode = ParseMode.HTML if i == 0 else None,
+        # Download audio — TikTok only
+        if platform == "tiktok" and data.get("audio_url"):
+            audio_path = await api.download_to_tempfile(
+                data["audio_url"], suffix=".mp3"
             )
-            for i, img_path in enumerate(image_paths)
+
+        # Build album — no captions for clean look
+        media_group = [
+            InputMediaPhoto(media=FSInputFile(img_path))
+            for img_path in image_paths
         ]
 
-        await status_msg.edit_text("⬆️ <i>Uploading album to Telegram...</i>", parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(
+            "<i>Uploading album...</i>", parse_mode=ParseMode.HTML
+        )
         album_msgs = await message.answer_media_group(media=media_group)
 
-        # Collect file_ids from the uploaded album
+        # Collect file_ids from uploaded photos
         photo_file_ids = []
         for msg in album_msgs:
             if msg.photo:
-                photo_file_ids.append(msg.photo[-1].file_id)  # [-1] = largest size
+                photo_file_ids.append(msg.photo[-1].file_id)
 
-        # Upload audio track
+        # Upload audio — TikTok only
         audio_file_id = None
-        if audio_path and audio_path.exists():
+        if platform == "tiktok" and audio_path and audio_path.exists():
             audio_msg = await message.answer_audio(
-                audio      = FSInputFile(audio_path),
-                caption    = "🎵 <b>Carousel Audio</b>",
-                parse_mode = ParseMode.HTML,
+                audio = FSInputFile(audio_path),
             )
             audio_file_id = audio_msg.audio.file_id
 
-        # Cache everything
+        # Persist to cache
         if photo_file_ids:
             await database.set_cached(
                 url           = url,
                 content_type  = "carousel",
                 file_ids      = photo_file_ids,
-                audio_file_id = audio_file_id,
+                audio_file_id = audio_file_id,  # None for non-TikTok
+                platform      = platform,
             )
 
         await bot.delete_message(message.chat.id, status_msg.message_id)
@@ -397,7 +478,7 @@ async def _process_carousel(
 async def scheduled_cleanup() -> None:
     """
     Periodic task: deletes cache records older than CACHE_TTL_DAYS.
-    Runs via APScheduler every 24 hours.
+    Runs every 24 hours via APScheduler.
     """
     logger.info("Running scheduled cache cleanup...")
     deleted = await database.delete_expired(ttl_days=CACHE_TTL_DAYS)
@@ -405,23 +486,23 @@ async def scheduled_cleanup() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main entrypoint
+# Main Entrypoint
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
     """
     Initialize all components and start the bot in long-polling mode.
     """
-    # Init DB
+    # Initialize SQLite database
     await database.init_db()
 
-    # Set up APScheduler — runs cleanup every 24 hours
+    # APScheduler — cache cleanup every 24 hours
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         scheduled_cleanup,
-        trigger  = "interval",
-        hours    = 24,
-        id       = "cache_cleanup",
+        trigger       = "interval",
+        hours         = 24,
+        id            = "cache_cleanup",
         max_instances = 1,
     )
     scheduler.start()
@@ -429,20 +510,20 @@ async def main() -> None:
 
     # Build bot & dispatcher
     bot = Bot(
-        token      = BOT_TOKEN,
-        default    = DefaultBotProperties(parse_mode=ParseMode.HTML),
+        token   = BOT_TOKEN,
+        default = DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
 
-    # Register middleware on the message observer
+    # Register cooldown middleware
     dp.message.middleware(CooldownMiddleware(cooldown=COOLDOWN_SEC))
 
     # Register router
     dp.include_router(router)
 
-    logger.info("Bot is starting...")
+    logger.info("Bot starting — TikTok · Instagram · Facebook")
+
     try:
-        # Drop any pending updates accumulated while the bot was offline
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, allowed_updates=["message"])
     finally:
